@@ -1,0 +1,54 @@
+
+services:
+  mast3r:
+    build:
+      context: ..
+      dockerfile: docker/dockerfile   # 你的 dockerfile 路徑
+    image: mast3r-slam:latest
+    container_name: mast3r-slam
+
+    # GPU
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=77
+
+    # GUI
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
+
+      # checkpoints / datasets / logs
+      - ../MASt3R-SLAM/checkpoints:/workspace/MASt3R-SLAM/checkpoints:ro
+      - ../MASt3R-SLAM/datasets:/workspace/MASt3R-SLAM/datasets:rw
+      - ../MASt3R-SLAM/logs:/workspace/MASt3R-SLAM/logs:rw
+
+      # Enhanced MASt3R-SLAM files - automatically sync changes
+      - ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main.py:rw
+      - ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main_fixed.py:rw
+      - ../MASt3R-SLAM/mast3r_slam/dataloader.py:/workspace/MASt3R-SLAM/mast3r_slam/dataloader.py:rw
+      - ../MASt3R-SLAM/resources/programs/lines.glsl:/workspace/MASt3R-SLAM/resources/programs/lines.glsl:rw
+
+      # Runtime scripts for enhanced functionality
+      - ./run_python.sh:/workspace/scripts/run_python.sh:ro
+      - ./run_python_enhanced.sh:/workspace/scripts/run_python_enhanced.sh:ro
+      - ./run_python_save.sh:/workspace/scripts/run_python_save.sh:ro
+      - ./container_startup.sh:/workspace/container_startup.sh:ro
+
+    # RealSense
+    privileged: true
+    devices:
+      - /dev:/dev
+      - /dev/bus/usb:/dev/bus/usb
+    volumes_from: []
+
+    network_mode: host
+    shm_size: "2g"
+    tty: true
+    stdin_open: true
+
+    # 預設進 bash，之後要跑程式再自己覆蓋
+    command: ["/bin/bash"]
