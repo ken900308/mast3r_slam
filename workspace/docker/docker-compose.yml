@@ -32,11 +32,13 @@ services:
       - ../MASt3R-SLAM/mast3r_slam/dataloader.py:/workspace/MASt3R-SLAM/mast3r_slam/dataloader.py:rw
       - ../MASt3R-SLAM/resources/programs/lines.glsl:/workspace/MASt3R-SLAM/resources/programs/lines.glsl:rw
 
+      # ROS Integration files
+      - ../MASt3R-SLAM/config/ros_integration.yaml:/workspace/MASt3R-SLAM/config/ros_integration.yaml:ro
+      - ../MASt3R-SLAM/simple_ply_ros2.py:/workspace/MASt3R-SLAM/simple_ply_ros2.py:rw
+
       # Runtime scripts for enhanced functionality
-      - ./run_python.sh:/workspace/scripts/run_python.sh:ro
       - ./run_python_enhanced.sh:/workspace/scripts/run_python_enhanced.sh:ro
-      - ./run_python_save.sh:/workspace/scripts/run_python_save.sh:ro
-      - ./container_startup.sh:/workspace/container_startup.sh:ro
+      - ../start_rosbridge.sh:/workspace/start_rosbridge.sh:ro
 
     # RealSense
     privileged: true

@@ -102,6 +102,7 @@ RUN apt-get update && apt-get install -y \
     ros-humble-sensor-msgs \
     ros-humble-std-msgs \
     ros-humble-rclpy \
+    ros-humble-rosbridge-server \
     python3-cv-bridge \
     && rm -rf /var/lib/apt/lists/*
 
