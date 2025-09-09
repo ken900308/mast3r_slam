@@ -28,17 +28,21 @@ services:
 
       # Enhanced MASt3R-SLAM files - automatically sync changes
       - ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main.py:rw
-      - ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main_fixed.py:rw
+      #- ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main_fixed.py:rw
       - ../MASt3R-SLAM/mast3r_slam/dataloader.py:/workspace/MASt3R-SLAM/mast3r_slam/dataloader.py:rw
-      - ../MASt3R-SLAM/resources/programs/lines.glsl:/workspace/MASt3R-SLAM/resources/programs/lines.glsl:rw
+      - ../MASt3R-SLAM/resources/programs/lines.glsl:/workspace/MASt3R-SLAM/resources/programs/lines.glsl:ro
 
       # ROS Integration files
-      - ../MASt3R-SLAM/config/ros_integration.yaml:/workspace/MASt3R-SLAM/config/ros_integration.yaml:ro
+      #- ../MASt3R-SLAM/config/ros_integration.yaml:/workspace/MASt3R-SLAM/config/ros_integration.yaml:ro
       - ../MASt3R-SLAM/simple_ply_ros2.py:/workspace/MASt3R-SLAM/simple_ply_ros2.py:rw
 
       # Runtime scripts for enhanced functionality
       - ./run_python_enhanced.sh:/workspace/scripts/run_python_enhanced.sh:ro
       - ../start_rosbridge.sh:/workspace/start_rosbridge.sh:ro
+
+      # udev rules for RealSense
+      - /etc/udev/rules.d:/etc/udev/rules.d:ro
+      - /run/udev:/run/udev:ro
 
     # RealSense
     privileged: true
