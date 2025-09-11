@@ -31,4 +31,4 @@ python3 simple_ply_ros2.py \
     --unity-coords \
     --decimation 0.1 \
     --max-points 120000 \
-    --poll-interval 2.0
+    --poll-interval 0.5
