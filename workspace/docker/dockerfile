@@ -125,6 +125,7 @@ RUN python3 -m pip install \
     matplotlib \
     scipy \
     wandb \
+    open3d \
     warmup_scheduler \
     pyrealsense2 \
     "imgui[glfw,opengl3]==2.0.0" \
