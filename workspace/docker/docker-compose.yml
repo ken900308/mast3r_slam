@@ -14,7 +14,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
-      - ROS_DOMAIN_ID=77
+      - ROS_DOMAIN_ID=0
 
     # GUI
     volumes:
@@ -33,10 +33,13 @@ services:
 
       # ROS Integration files
       - ../MASt3R-SLAM/simple_ply_ros2.py:/workspace/MASt3R-SLAM/simple_ply_ros2.py:rw
+      - ../MASt3R-SLAM/mast3r_slam_visual_ros2.py:/workspace/MASt3R-SLAM/mast3r_slam_visual_ros2.py:rw
+      - ../MASt3R-SLAM/launch_mast3r_visual_ros2.sh:/workspace/MASt3R-SLAM/launch_mast3r_visual_ros2.sh:rw
 
       # Runtime scripts for enhanced functionality
       - ./run_python_enhanced.sh:/workspace/scripts/run_python_enhanced.sh:ro
       - ../start_rosbridge.sh:/workspace/start_rosbridge.sh:ro
+      - ./launch_simple_ply_ros2.sh:/workspace/launch_simple_ply_ros2.sh:rw
 
       # udev rules for RealSense
       - /etc/udev/rules.d:/etc/udev/rules.d:ro
