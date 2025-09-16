@@ -109,13 +109,24 @@ class SimplePLYMonitorROS2Publisher(Node):
             if not ply_files:
                 return None
             
+            # Filter out empty or very small files (< 1KB) that might be incomplete
+            valid_files = []
+            for f in ply_files:
+                try:
+                    if os.path.getsize(f) > 1024:  # At least 1KB
+                        valid_files.append(f)
+                except OSError:
+                    continue  # Skip files that can't be accessed
+            
+            if not valid_files:
+                return None
+            
             # Sort by modification time, get the latest
-            latest_file = max(ply_files, key=os.path.getmtime)
+            latest_file = max(valid_files, key=os.path.getmtime)
             return latest_file
             
         except Exception as e:
             self.get_logger().error(f"Error finding PLY files: {e}")
-            return None
             return None
     
     def check_for_new_files(self):
@@ -129,10 +140,13 @@ class SimplePLYMonitorROS2Publisher(Node):
             # Check if this is a new file or if it's been modified
             file_mtime = os.path.getmtime(latest_file)
             
+            # Always process if file is different OR if modification time is newer
+            # Also add small tolerance for file system timestamp precision
             if (latest_file != self.last_processed_file or 
-                file_mtime > self.last_processed_time):
+                file_mtime > self.last_processed_time + 0.1):  # 0.1s tolerance
                 
                 self.get_logger().info(f"📄 New/updated PLY file detected: {latest_file}")
+                self.get_logger().info(f"   File mtime: {file_mtime}, Last processed: {self.last_processed_time}")
                 self.process_ply_file(latest_file)
                 self.last_processed_file = latest_file
                 self.last_processed_time = file_mtime

@@ -41,6 +41,10 @@ docker compose run mast3r bash -lc "
   nvcc --version || true
   python -c 'import torch, ctypes.util; print(\"torch:\", torch.__version__); print(\"torch.cuda:\", torch.version.cuda); print(\"is_available:\", torch.cuda.is_available()); print(\"cudart:\", ctypes.util.find_library(\"cudart\"))'
 
+  echo '>>> 安裝 ROS2 rosbridge'
+  apt-get update && apt-get install -y --no-install-recommends ros-humble-rosbridge-server && rm -rf /var/lib/apt/lists/*
+  echo '✓ rosbridge-server installed'
+
   echo '>>> 進到專案根目錄'
   cd /workspace/MASt3R-SLAM
 

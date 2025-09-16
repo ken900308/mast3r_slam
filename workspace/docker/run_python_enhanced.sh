@@ -6,12 +6,25 @@
 
 # Display help information
 echo "=== MASt3R-SLAM with Periodic Saving ==="
+echo "Usage: $0 [--no-viz] [--calib=path/to/intrinsics.yaml] [--dataset=dataset_path]"
+echo ""
 echo "Features:"
 echo "  - Saves .ply files every 30 seconds automatically"
 echo "  - Graceful shutdown: Press Ctrl+C to save and exit safely"
 echo "  - Files saved to: logs/realsense_live/"
 echo "  - Partial saves: realsense_live_partial_HHMMSS.ply"
 echo "  - Final save: realsense_live.ply"
+echo ""
+echo "Options:"
+echo "  --no-viz                     Run without 3D visualization GUI"
+echo "  --calib=intrinsics.yaml      Use custom camera intrinsics"
+echo "  --dataset=path               Use specific dataset (default: realsense)"
+echo ""
+echo "Examples:"
+echo "  $0                                          # RealSense with auto-detect intrinsics"
+echo "  $0 --calib=config/d435_intrinsics.yaml     # RealSense with D435 intrinsics"
+echo "  $0 --dataset=datasets/tum/rgbd_dataset_freiburg1_desk  # TUM dataset"
+echo "  $0 --no-viz --calib=config/intrinsics.yaml # Headless with custom intrinsics"
 echo ""
 echo "Controls:"
 echo "  - Ctrl+C: Save current reconstruction and exit gracefully"
@@ -77,13 +90,35 @@ if command -v xhost >/dev/null 2>&1; then
     xhost +local:docker >/dev/null 2>&1 || true
 fi
 
-# Determine mode based on arguments
-if [ "$1" = "--no-viz" ]; then
-    echo "Running in headless mode (no visualization)"
-    VIZ_FLAG="--no-viz"
-else
+# Parse arguments
+VIZ_FLAG=""
+CALIB_FLAG=""
+DATASET_FLAG="--dataset realsense"
+
+for arg in "$@"; do
+    case $arg in
+        --no-viz)
+            echo "Running in headless mode (no visualization)"
+            VIZ_FLAG="--no-viz"
+            ;;
+        --calib=*)
+            CALIB_FILE="${arg#*=}"
+            CALIB_FLAG="--calib $CALIB_FILE"
+            echo "Using camera intrinsics: $CALIB_FILE"
+            ;;
+        --dataset=*)
+            DATASET_FLAG="$arg"
+            echo "Using dataset: ${arg#*=}"
+            ;;
+        *)
+            echo "Unknown argument: $arg"
+            echo "Usage: $0 [--no-viz] [--calib=path/to/intrinsics.yaml] [--dataset=dataset_path]"
+            ;;
+    esac
+done
+
+if [ -z "$VIZ_FLAG" ]; then
     echo "Running with 3D visualization GUI"
-    VIZ_FLAG=""
 fi
 
 # Set up signal handling to properly forward SIGINT to container
@@ -104,8 +139,11 @@ docker exec "$CONTAINER_NAME" bash -c "
 cd /workspace/MASt3R-SLAM
 export PYTHONPATH=\"/workspace/MASt3R-SLAM/thirdparty/mast3r:/workspace/MASt3R-SLAM:\${PYTHONPATH:-}\"
 echo 'Starting MASt3R-SLAM with periodic saving...'
+echo 'Dataset: ${DATASET_FLAG#--dataset=}'
+echo 'Calibration: ${CALIB_FLAG:-Auto-detect}'
+echo 'Visualization: ${VIZ_FLAG:-Enabled}'
 echo 'Press Ctrl+C to save and exit gracefully'
-python main.py --dataset realsense --config config/base.yaml $VIZ_FLAG
+python main.py $DATASET_FLAG --config config/base.yaml $CALIB_FLAG $VIZ_FLAG
 " &
 
 # Store the background process PID
