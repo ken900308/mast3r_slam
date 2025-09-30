@@ -13,7 +13,7 @@ source /opt/ros/humble/setup.bash
 export PYTHONPATH="/workspace/MASt3R-SLAM/thirdparty/mast3r:/workspace/MASt3R-SLAM:${PYTHONPATH:-}"
 
 # Change to correct directory
-cd /workspace
+cd /workspace/MASt3R-SLAM
 
 echo "🎮 Unity Point Cloud Publisher"
 echo "==============================="

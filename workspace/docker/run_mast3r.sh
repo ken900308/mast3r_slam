@@ -15,7 +15,8 @@ if command -v xhost >/dev/null 2>&1; then
 fi
 
 # 用 docker compose 啟動工作容器，在容器內做安裝＋執行（不自動刪除）
-docker compose run mast3r bash -lc "
+docker compose up -d mast3r
+docker exec -it mast3r-slam bash -lc "
   set -euo pipefail
 
   echo '>>> Fixing GUI Resources for MASt3R-SLAM'
@@ -75,7 +76,4 @@ if not torch.cuda.is_available():
 PY
 
   echo '>>> 安裝完成！容器已準備就緒'
-  echo '>>> 要執行程式，請使用: ./run_python.sh'
-  echo '>>> 容器將保持運行狀態...'
-  tail -f /dev/null
 "

@@ -27,19 +27,15 @@ services:
       - ../MASt3R-SLAM/logs:/workspace/MASt3R-SLAM/logs:rw
 
       # Enhanced MASt3R-SLAM files - automatically sync changes
-      - ../MASt3R-SLAM/main.py:/workspace/MASt3R-SLAM/main.py:rw
-      - ../MASt3R-SLAM/mast3r_slam/dataloader.py:/workspace/MASt3R-SLAM/mast3r_slam/dataloader.py:rw
       - ../MASt3R-SLAM/resources/programs/lines.glsl:/workspace/MASt3R-SLAM/resources/programs/lines.glsl:ro
 
-      # ROS Integration files
-      - ../MASt3R-SLAM/simple_ply_ros2.py:/workspace/MASt3R-SLAM/simple_ply_ros2.py:rw
-      - ../MASt3R-SLAM/mast3r_slam_visual_ros2.py:/workspace/MASt3R-SLAM/mast3r_slam_visual_ros2.py:rw
-      - ../MASt3R-SLAM/launch_mast3r_visual_ros2.sh:/workspace/MASt3R-SLAM/launch_mast3r_visual_ros2.sh:rw
+      - ../MASt3R-SLAM:/workspace/MASt3R-SLAM:rw
 
       # Runtime scripts for enhanced functionality
-      - ./run_python_enhanced.sh:/workspace/scripts/run_python_enhanced.sh:ro
+      - ./run_python_enhanced.sh:/workspace/run_python_enhanced.sh:ro
       - ../start_rosbridge.sh:/workspace/start_rosbridge.sh:ro
       - ./launch_simple_ply_ros2.sh:/workspace/launch_simple_ply_ros2.sh:rw
+      - ./launch_unity_publisher.sh:/workspace/launch_unity_publisher.sh:rw
 
       # udev rules for RealSense
       - /etc/udev/rules.d:/etc/udev/rules.d:ro

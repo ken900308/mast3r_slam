@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-MASt3R-SLAM ROS2 Node with Visualization
+MASt3R-SLAM ROS2 Node with Visualization (Improved Version)
 
-This node integrates the simple image receiver with MASt3R-SLAM processing
-and enables visualization for monitoring the inference process.
+主要改進：
+1. 使用短 FIFO (deque) 取代深 queue，避免批次跳幀
+2. 視覺化子程序改用 CPU only，避免跨程序 CUDA 問題
+3. 更清晰的日誌輸出
 """
 
 import sys
@@ -11,7 +13,7 @@ import os
 import time
 import signal
 import threading
-import queue
+from collections import deque  # 改進 1: 使用 deque 作為短 FIFO
 import numpy as np
 import cv2
 import torch
@@ -75,6 +77,17 @@ def cleanup_signal_handler(sig, frame):
     import os
     os._exit(0)
 
+def _run_visualization_cpu(cfg, states, keyframes, main2viz, viz2main):
+    """
+    改進 2: 視覺化子程序強制使用 CPU，避免跨程序 CUDA 記憶體問題
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""  # 子程序看不到 GPU
+    
+    # 現在才導入 visualization，確保它在 CPU-only 環境下初始化
+    from mast3r_slam.visualization import run_visualization
+    run_visualization(cfg, states, keyframes, main2viz, viz2main)
+
 class MASt3RSLAMVisualizationNode(Node):
     """MASt3R-SLAM ROS2 Node with visualization for monitoring inference"""
     
@@ -94,10 +107,11 @@ class MASt3RSLAMVisualizationNode(Node):
         # Initialize parameters
         self.declare_parameter('config_file', 'config/base.yaml')
         self.declare_parameter('save_as', 'stretch3_slam')
-        self.declare_parameter('image_topic', '/camera/camera/color/image_raw/compressed')
+        self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('device', 'cuda:0')
         self.declare_parameter('enable_visualization', False)  # 預設關閉視覺化
+        self.declare_parameter('max_fps', 15.0)  # 新增：最大處理 FPS
         
         # Get parameters
         self.config_file = self.get_parameter('config_file').get_parameter_value().string_value
@@ -106,42 +120,53 @@ class MASt3RSLAMVisualizationNode(Node):
         self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         self.device = self.get_parameter('device').get_parameter_value().string_value
         self.enable_visualization = self.get_parameter('enable_visualization').get_parameter_value().bool_value
+        self.max_fps = self.get_parameter('max_fps').get_parameter_value().double_value
         
         # Initialize CV bridge
         self.bridge = CvBridge()
         
-        # Image buffer and threading
-        self.image_buffer = queue.Queue(maxsize=10)  # 增加緩衝區避免阻塞，但仍保持即時性
+        # 改進 1: 使用短 FIFO (deque) 取代深 queue
+        # maxlen=3 確保只保留最近的 3 張影像，避免延遲堆積
+        self.image_buffer = deque(maxlen=3)
+        self.buffer_lock = threading.Lock()
+        
+        # FPS 控制（可選的額外節流）
+        self.min_frame_interval = 1.0 / self.max_fps if self.max_fps > 0 else 0
+        self.last_frame_time = 0
+        
+        # Camera info and processing state
         self.camera_info = None
         self.processing_thread = None
         self.is_processing = False
         
         # Statistics
         self.image_count = 0
-        self.last_timestamp = None  # 用於檢查時間戳穩定性
+        self.dropped_count = 0  # 新增：追蹤丟棄的幀數
+        self.last_timestamp = None
         self.processed_count = 0
         self.start_time = time.time()
         
         # Thread safety locks
         self.keyframes_lock = threading.Lock()
         self.states_lock = threading.Lock()
-        self.last_keyframe_count = 0  # 用於節流存檔
+        self.save_lock = threading.Lock()  # 改進 3: 防止儲存重入
+        self.last_keyframe_count = 0
         
         # 週期性儲存管理
-        self.save_interval = 5.0  # 每 5 秒儲存一次（與 Unity 即時顯示相配合）
+        self.save_interval = 5.0  # 每 5 秒儲存一次
         self.last_save_time = 0
         
-        # QoS profiles for stable SLAM processing (改善穩定性)
+        # QoS profiles for stable SLAM processing
         image_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,  # 改成可靠傳輸，避免掉包
+            reliability=ReliabilityPolicy.RELIABLE,  # 可靠傳輸
             history=HistoryPolicy.KEEP_LAST,
-            depth=10,  # 測試更大緩衝深度，觀察穩定性與延遲的平衡
+            depth=5,  # 減少深度，配合短 FIFO
             durability=DurabilityPolicy.VOLATILE
         )
         
         # Create subscribers
         self.image_sub = self.create_subscription(
-            Image,  # 改用原始圖像，避免壓縮損失
+            Image,
             self.image_topic,
             self.image_callback,
             image_qos
@@ -151,13 +176,13 @@ class MASt3RSLAMVisualizationNode(Node):
             CameraInfo,
             self.camera_info_topic,
             self.camera_info_callback,
-            image_qos  # Use same QoS to avoid compatibility issues
+            image_qos
         )
         
         # Timer for stats
         self.stats_timer = self.create_timer(5.0, self.print_stats)
         
-        # Timer for periodic saving (與 Unity 同步)
+        # Timer for periodic saving
         self.save_timer = self.create_timer(self.save_interval, self.periodic_save_callback)
         
         self.get_logger().info(f"MASt3R-SLAM Node with Visualization initialized")
@@ -165,7 +190,14 @@ class MASt3RSLAMVisualizationNode(Node):
         self.get_logger().info(f"Camera info topic: {self.camera_info_topic}")
         self.get_logger().info(f"Using device: {self.device}")
         self.get_logger().info(f"Save as: {self.save_as}")
-        self.get_logger().info("🎥 Visualization ENABLED - You can monitor the SLAM process")
+        self.get_logger().info(f"Max FPS: {self.max_fps}")
+        self.get_logger().info(f"Image buffer size: 3 (short FIFO)")
+        
+        # 改進 2: 根據參數正確顯示視覺化狀態
+        if self.enable_visualization:
+            self.get_logger().info("🎥 Visualization ENABLED - You can monitor the SLAM process")
+        else:
+            self.get_logger().info("🖥️ Visualization DISABLED (headless mode)")
         
         # Initialize MASt3R-SLAM components
         self.initialize_slam()
@@ -180,7 +212,9 @@ class MASt3RSLAMVisualizationNode(Node):
             self.get_logger().info(f"  Intrinsics: fx={K[0,0]:.2f}, fy={K[1,1]:.2f}, cx={K[0,2]:.2f}, cy={K[1,2]:.2f}")
         
     def image_callback(self, msg):
-        """Receive raw images from robot - 阻塞式處理，避免掉幀"""
+        """
+        改進 1: 使用非阻塞的短 FIFO 處理影像
+        """
         try:
             if msg is None:
                 self.get_logger().warning("Received None message")
@@ -190,7 +224,16 @@ class MASt3RSLAMVisualizationNode(Node):
                 self.get_logger().warning("Message has no data")
                 return
             
-            # Convert raw image to OpenCV format (無壓縮損失)
+            # FPS 節流（可選）
+            current_time = time.time()
+            if self.min_frame_interval > 0:
+                if current_time - self.last_frame_time < self.min_frame_interval:
+                    # 跳過太頻繁的幀
+                    self.dropped_count += 1
+                    return
+                self.last_frame_time = current_time
+            
+            # Convert raw image to OpenCV format
             cv_image = self.bridge.imgmsg_to_cv2(msg, "rgb8")
             
             if cv_image is None:
@@ -206,32 +249,36 @@ class MASt3RSLAMVisualizationNode(Node):
             
             timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             
-            # 檢查時間戳穩定性 (避免大幅跳躍)
+            # 檢查時間戳穩定性
             if hasattr(self, 'last_timestamp') and self.last_timestamp is not None:
                 dt = timestamp - self.last_timestamp
                 if dt > 0.5:  # 超過 0.5 秒的跳躍
-                    self.get_logger().warning(f"⚠️  Large timestamp jump: {dt:.3f}s")
+                    self.get_logger().warning(f"⚠️ Large timestamp jump: {dt:.3f}s")
                 elif dt < 0:  # 時間倒退
-                    self.get_logger().warning(f"⚠️  Timestamp went backwards: {dt:.3f}s")
+                    self.get_logger().warning(f"⚠️ Timestamp went backwards: {dt:.3f}s")
             self.last_timestamp = timestamp
             
-            # 阻塞式放入 buffer - 確保每一幀都被處理，像 main.py 一樣
-            try:
-                self.image_buffer.put((timestamp, cv_image), block=True, timeout=1.0)
-                self.image_count += 1
-                
-                if self.image_count == 1:
-                    self.get_logger().info(f"🎉 First image received and rotated!")
-                    self.get_logger().info(f"  Shape after rotation: {cv_image.shape}")
-                    
-            except Exception as e:
-                self.get_logger().warning(f"Buffer timeout or error: {str(e)}")
+            # 改進 1: 使用非阻塞的 deque append
+            # 如果 buffer 滿了，自動丟棄最舊的影像
+            with self.buffer_lock:
+                old_size = len(self.image_buffer)
+                self.image_buffer.append((timestamp, cv_image))
+                if old_size == 3:  # maxlen=3，滿了會自動丟棄最舊的
+                    self.dropped_count += 1
+                    if self.dropped_count % 50 == 0:  # 每 50 幀報告一次
+                        self.get_logger().info(f"📊 Dropped {self.dropped_count} frames due to processing lag")
+            
+            self.image_count += 1
+            
+            if self.image_count == 1:
+                self.get_logger().info(f"🎉 First image received and rotated!")
+                self.get_logger().info(f"  Shape after rotation: {cv_image.shape}")
                 
         except Exception as e:
             self.get_logger().error(f"Error processing image: {str(e)}")
     
     def initialize_slam(self):
-        """Initialize MASt3R-SLAM components with visualization"""
+        """Initialize MASt3R-SLAM components with improved visualization"""
         global should_exit
         
         try:
@@ -249,14 +296,14 @@ class MASt3RSLAMVisualizationNode(Node):
             timeout_start = time.time()
             while self.camera_info is None and not should_exit:
                 if time.time() - timeout_start > 10.0:  # 10 second timeout
-                    self.get_logger().warn("⚠️  Camera info timeout - proceeding with default settings")
+                    self.get_logger().warn("⚠️ Camera info timeout - proceeding with default settings")
                     break
                 rclpy.spin_once(self, timeout_sec=0.1)
             
             if should_exit:
                 return
                 
-            # Set up camera intrinsics - we'll determine correct dimensions after MASt3R processing
+            # Set up camera intrinsics
             self.raw_h, self.raw_w = 640, 480  # After rotation: D435i 480x640 -> 640x480
             if self.camera_info:
                 self.setup_camera_intrinsics()
@@ -273,23 +320,18 @@ class MASt3RSLAMVisualizationNode(Node):
             self.model.share_memory()
             self.get_logger().info("✅ MASt3R model loaded")
             
-            # Camera intrinsics will be set up when SLAM is initialized with correct dimensions
-            self.get_logger().info("✅ MASt3R model loaded, ready for SLAM initialization")
-            
-            # Create a dataset-like object for saving (like RealsenseDataset)
+            # Create a dataset-like object for saving
             class SimpleDataset:
                 def __init__(self):
                     import pathlib
                     import time
                     self.save_results = True
                     self.timestamps = []
-                    self.dataset_path = pathlib.Path("stretch3_ros2_slam")  # Used for saving results
+                    self.dataset_path = pathlib.Path("stretch3_ros2_slam")
                     self.start_time = time.time()
                     
                 def get_timestamps_for_keyframes(self, num_keyframes):
                     """Generate timestamps for keyframes based on current time"""
-                    # We need to ensure timestamps exist for all frame_ids, not just keyframe count
-                    # Find the maximum frame_id among keyframes to generate sufficient timestamps
                     max_frame_id = 0
                     try:
                         if hasattr(self, '_parent_keyframes') and self._parent_keyframes:
@@ -298,14 +340,11 @@ class MASt3RSLAMVisualizationNode(Node):
                                 if hasattr(kf, 'frame_id'):
                                     max_frame_id = max(max_frame_id, kf.frame_id)
                     except Exception as e:
-                        # Fallback: use a generous estimate based on typical SLAM frame-to-keyframe ratios
-                        max_frame_id = num_keyframes * 100  # Conservative estimate
+                        max_frame_id = num_keyframes * 100
                     
-                    # Ensure we have timestamps for all frame_ids up to max_frame_id
-                    needed_timestamps = max(max_frame_id + 10, num_keyframes)  # Add buffer
+                    needed_timestamps = max(max_frame_id + 10, num_keyframes)
                     
                     while len(self.timestamps) < needed_timestamps:
-                        # Generate missing timestamps with consistent intervals
                         next_idx = len(self.timestamps)
                         self.timestamps.append(self.start_time + next_idx * 0.033)  # ~30 FPS intervals
                     
@@ -315,22 +354,19 @@ class MASt3RSLAMVisualizationNode(Node):
             
             # Initialize default window message
             self.last_msg = WindowMsg()
-            self.get_logger().info(f"🔍 Initial WindowMsg: terminated={self.last_msg.is_terminated}, paused={self.last_msg.is_paused}")
             
-            self.get_logger().info(f"🔧 Visualization {'enabled' if self.enable_visualization else 'disabled'}")
-            
-            # Tracker will be initialized after SLAM setup with correct keyframes object
+            # Tracker will be initialized after SLAM setup
             self.tracker = None
             
-            # Processes will be started after SLAM initialization with correct dimensions
+            # Processes will be started after SLAM initialization
             self.viz_process = None
             self.backend_process = None
             
-            # Start processing thread - this will initialize SLAM and start processes
+            # Start processing thread
             self.is_processing = True
             self.processing_thread = threading.Thread(target=self.process_images)
             self.processing_thread.start()
-            self.get_logger().info("🚀 SLAM processing thread started - waiting for first image to initialize SLAM...")
+            self.get_logger().info("🚀 SLAM processing thread started - waiting for first image...")
             
         except Exception as e:
             import traceback
@@ -354,23 +390,13 @@ class MASt3RSLAMVisualizationNode(Node):
             'cy': original_width - 1 - K_matrix[0, 2]  # adjusted cy
         }
         
-        # Create intrinsics object - skip complex calibration for now
-        # Just use the basic rotated intrinsics directly
-        intrinsics = None  # Skip complex calibration
-        
-        self.get_logger().info("📐 Using simplified intrinsics (skipping undistortion)")
-        
-        # Store for keyframes - check if intrinsics is None
-        if intrinsics is not None:
-            self.K = torch.from_numpy(intrinsics.K_frame).to(self.device, dtype=torch.float32)
-        else:
-            # Fall back to basic intrinsics matrix
-            K_basic = np.array([
-                [rotated_intrinsics['fx'], 0, rotated_intrinsics['cx']],
-                [0, rotated_intrinsics['fy'], rotated_intrinsics['cy']],
-                [0, 0, 1]
-            ], dtype=np.float32)
-            self.K = torch.from_numpy(K_basic).to(self.device, dtype=torch.float32)
+        # Create basic intrinsics matrix
+        K_basic = np.array([
+            [rotated_intrinsics['fx'], 0, rotated_intrinsics['cx']],
+            [0, rotated_intrinsics['fy'], rotated_intrinsics['cy']],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        self.K = torch.from_numpy(K_basic).to(self.device, dtype=torch.float32)
         
         self.get_logger().info(f"📐 Camera intrinsics adjusted for rotation:")
         self.get_logger().info(f"  Original: {original_width}x{original_height}")
@@ -378,30 +404,30 @@ class MASt3RSLAMVisualizationNode(Node):
         self.get_logger().info(f"  Rotated intrinsics: fx={rotated_intrinsics['fx']:.2f}, fy={rotated_intrinsics['fy']:.2f}")
         
     def process_images(self):
-        """Main SLAM processing loop with visualization feedback"""
+        """
+        改進 1: 使用短 FIFO 處理，確保處理連續的幀
+        """
         global should_exit
         
         i = 0
         fps_timer = time.time()
+        consecutive_empty = 0  # 追蹤連續空 buffer 次數
         
         self.get_logger().info("🔄 Starting SLAM processing loop...")
         
-        # Main processing loop - mimic original main.py structure
-        while True:  # Infinite loop like original
+        while True:
             try:
-                # Check for graceful shutdown signal (like original)
+                # Check for graceful shutdown signal
                 if should_exit:
-                    self.get_logger().info("� Graceful shutdown initiated...")
+                    self.get_logger().info("🛑 Graceful shutdown initiated...")
                     break
                 
-                # Only check SLAM state and visualization messages after SLAM is initialized
+                # Check SLAM state and visualization messages
                 if self.slam_initialized and hasattr(self, 'states') and self.states:
                     mode = self.states.get_mode()
                     msg = try_get_msg(self.viz2main) if hasattr(self, 'viz2main') else None
                     if msg is not None:
                         self.last_msg = msg
-                        if i % 100 == 0:  # Log occasionally
-                            self.get_logger().info(f"🖥️  Viz msg: terminated={msg.is_terminated}, paused={msg.is_paused}")
                     
                     if hasattr(self, 'last_msg') and self.last_msg and self.last_msg.is_terminated:
                         self.get_logger().info("🛑 Termination signal from visualization")
@@ -416,21 +442,21 @@ class MASt3RSLAMVisualizationNode(Node):
                     if hasattr(self, 'last_msg') and self.last_msg and not self.last_msg.is_paused:
                         self.states.unpause()
                 
-                # Get image from buffer - wait longer, don't give up easily
-                try:
-                    timestamp, img = self.image_buffer.get(timeout=2.0)
-                    
-                    # Validate the image data
-                    if img is None:
-                        self.get_logger().warning("⚠️  Received None image, skipping...")
-                        continue 
-                        
-                    if not hasattr(img, 'shape') or len(img.shape) != 3:
-                        self.get_logger().warning(f"⚠️  Invalid image shape: {img.shape if hasattr(img, 'shape') else 'No shape'}, skipping...")
-                        continue
-                        
-                except queue.Empty:
-                    # No new images, but don't exit - just continue waiting (like original waits for dataset)
+                # 改進 1: 從短 FIFO 取出最舊的影像處理
+                timestamp = None
+                img = None
+                with self.buffer_lock:
+                    if self.image_buffer:
+                        timestamp, img = self.image_buffer.popleft()  # 取最舊的
+                        consecutive_empty = 0
+                    else:
+                        consecutive_empty += 1
+                
+                if img is None:
+                    # 沒有新影像，短暫等待
+                    if consecutive_empty > 100:  # 約 1 秒沒有影像
+                        if consecutive_empty % 100 == 0:  # 每秒報告一次
+                            self.get_logger().info("⏳ Waiting for images...")
                     time.sleep(0.01)
                     continue
                 
@@ -442,61 +468,57 @@ class MASt3RSLAMVisualizationNode(Node):
                 
                 # Initialize SLAM with correct dimensions from first frame
                 if not self.slam_initialized:
-                    # 統一使用 MASt3R 的標準尺寸
-                    mast3r_size = 512  # MASt3R 標準處理尺寸
+                    mast3r_size = 512  # MASt3R standard size
                     
                     # Process first image through MASt3R to get actual dimensions
                     temp_frame = create_frame(0, img, np.eye(4), img_size=mast3r_size, device=self.device)
                     frame_shape = temp_frame.img.shape
-                    self.get_logger().info(f"🔍 Frame tensor shape: {frame_shape}")
+                    self.get_logger().info(f"📐 Frame tensor shape: {frame_shape}")
                     
-                    # Extract dimensions correctly from tensor shape: [B, C, H, W] or [C, H, W]
+                    # Extract dimensions correctly from tensor shape
                     if len(frame_shape) == 4:  # Batch format: [B, C, H, W]
-                        actual_h, actual_w = frame_shape[2], frame_shape[3]  # H, W from [B, C, H, W]
+                        actual_h, actual_w = frame_shape[2], frame_shape[3]
                     elif len(frame_shape) == 3:  # CHW format: [C, H, W]
-                        actual_h, actual_w = frame_shape[1], frame_shape[2]  # H, W from [C, H, W]
+                        actual_h, actual_w = frame_shape[1], frame_shape[2]
                     else:
                         self.get_logger().error(f"❌ Unexpected frame shape: {frame_shape}")
                         return
                     
-                    self.get_logger().info(f"🔧 Initializing SLAM with aligned dimensions: {actual_h}x{actual_w} (MASt3R size: {mast3r_size})")
+                    self.get_logger().info(f"🔧 Initializing SLAM with dimensions: {actual_h}x{actual_w}")
                     
-                    # 確保 SharedKeyframes 和 create_frame 使用相同的尺寸
                     self.h, self.w = actual_h, actual_w
-                    self.mast3r_size = mast3r_size  # 儲存用於後續 create_frame 調用
+                    self.mast3r_size = mast3r_size
                     self.manager = mp.Manager()
-                    self.main2viz = new_queue(self.manager, False)  # Enable visualization
-                    self.viz2main = new_queue(self.manager, False)
+                    self.main2viz = new_queue(self.manager, not self.enable_visualization)
+                    self.viz2main = new_queue(self.manager, not self.enable_visualization)
                     
                     self.keyframes = SharedKeyframes(self.manager, self.h, self.w)
                     self.states = SharedStates(self.manager, self.h, self.w)
                     
-                    # NOW initialize the tracker with the proper keyframes object
+                    # Initialize the tracker
                     self.tracker = FrameTracker(self.model, self.keyframes, self.device)
-                    self.get_logger().info("🎯 Tracker initialized with SharedKeyframes")
+                    self.get_logger().info("🎯 Tracker initialized")
                     
-                    # Optionally set up camera intrinsics for keyframes (like original main.py)
-                    # Check if we should use calibration (from config file)
+                    # Set up camera intrinsics if available
                     from mast3r_slam.config import config
                     if hasattr(self, 'K') and self.K is not None and config.get('use_calib', False):
                         self.keyframes.set_intrinsics(self.K)
-                        self.get_logger().info("✅ Camera intrinsics configured for actual dimensions")
-                    else:
-                        self.get_logger().info("🔧 Running without camera intrinsics (like original MASt3R-SLAM)")
+                        self.get_logger().info("✅ Camera intrinsics configured")
                     
-                    # Start visualization process only if enabled
+                    # 改進 2: 使用 CPU-only 視覺化子程序
                     if self.enable_visualization:
-                        self.get_logger().info("🎥 Starting visualization process...")
+                        self.get_logger().info("🎥 Starting CPU-only visualization process...")
                         self.viz_process = mp.Process(
-                            target=run_visualization,
+                            target=_run_visualization_cpu,  # 使用 CPU-only 版本
                             args=(config, self.states, self.keyframes, self.main2viz, self.viz2main),
                         )
                         self.viz_process.start()
-                        self.get_logger().info("✅ Visualization started")
+                        self.get_logger().info("✅ Visualization started (CPU-only for safety)")
                     else:
-                        self.get_logger().info("📺 Visualization disabled (enable_visualization=False)")
+                        self.get_logger().info("📺 Visualization disabled")
                     
-                    self.get_logger().info("⚙️  Starting backend process...")
+                    # Start backend process
+                    self.get_logger().info("⚙️ Starting backend process...")
                     self.backend_process = mp.Process(
                         target=run_backend, 
                         args=(config, self.model, self.states, self.keyframes, getattr(self, 'K', None))
@@ -505,21 +527,16 @@ class MASt3RSLAMVisualizationNode(Node):
                     self.get_logger().info("✅ Backend started")
                     
                     self.slam_initialized = True
-                    self.get_logger().info("🚀 SLAM fully initialized with visualization!")
+                    self.get_logger().info("🚀 SLAM fully initialized!")
                 
-                # Now start continuous processing loop
-                self.get_logger().info("🔄 Starting continuous SLAM processing...")
-                
-                # Continue to process the first frame like the original main.py
+                # Process the frame
                 mode = self.states.get_mode()
                 msg = try_get_msg(self.viz2main)
                 if msg is not None:
                     self.last_msg = msg
-                    self.get_logger().info(f"🖥️  Viz msg: terminated={msg.is_terminated}, paused={msg.is_paused}")
                 
-                # Only break on actual termination signal (not initial state)
                 if msg is not None and hasattr(self, 'last_msg') and self.last_msg and self.last_msg.is_terminated:
-                    self.get_logger().info("🛑 Termination signal received, stopping SLAM")
+                    self.get_logger().info("🛑 Termination signal received")
                     self.states.set_mode(Mode.TERMINATED)
                     break
 
@@ -531,8 +548,6 @@ class MASt3RSLAMVisualizationNode(Node):
                 if hasattr(self, 'last_msg') and self.last_msg and not self.last_msg.is_paused:
                     self.states.unpause()
 
-                # MASt3R handles resizing, no need to manually resize
-                
                 # Create frame
                 T_WC = (
                     lietorch.Sim3.Identity(1, device=self.device)
@@ -540,23 +555,31 @@ class MASt3RSLAMVisualizationNode(Node):
                     else self.states.get_frame().T_WC
                 )
                 
-                # 使用與 SharedKeyframes 一致的尺寸
                 frame = create_frame(i, img, T_WC, img_size=self.mast3r_size, device=self.device)
 
-                # 更新 timestamps（仿照 main.py 的 dataset timestamps）
-                current_time = time.time()
+                # 改進 4: 使用相機的實際時間戳，而非合成時間
                 if hasattr(self, 'dataset'):
-                    # 確保 timestamps 足夠長度
-                    while len(self.dataset.timestamps) <= i:
-                        self.dataset.timestamps.append(current_time + len(self.dataset.timestamps) * 0.1)
+                    if len(self.dataset.timestamps) == i:
+                        self.dataset.timestamps.append(timestamp)
+                    elif len(self.dataset.timestamps) < i:
+                        # 填充缺失的時間戳
+                        last_ts = self.dataset.timestamps[-1] if self.dataset.timestamps else timestamp
+                        gap = i - len(self.dataset.timestamps)
+                        # 線性插值填充中間的時間戳
+                        for j in range(gap):
+                            interp_ts = last_ts + (timestamp - last_ts) * (j + 1) / (gap + 1)
+                            self.dataset.timestamps.append(interp_ts)
+                        self.dataset.timestamps.append(timestamp)
+                    else:
+                        # 更新現有的時間戳
+                        self.dataset.timestamps[i] = timestamp
                 
+                # Process based on current mode
                 if mode == Mode.INIT:
-                    # Initialize via mono inference
                     self.get_logger().info("🔧 Initializing SLAM with first frame...")
                     X_init, C_init = mast3r_inference_mono(self.model, frame)
                     frame.update_pointmap(X_init, C_init)
                     
-                    # 保護 keyframes 更新
                     with self.keyframes_lock:
                         self.keyframes.append(frame)
                         
@@ -593,32 +616,28 @@ class MASt3RSLAMVisualizationNode(Node):
                             self.keyframes.append(frame)
                         with self.states_lock:
                             self.states.queue_global_optimization(len(self.keyframes) - 1)
-                        self.get_logger().info(f"🔑 New keyframe added (total: {len(self.keyframes)})")
-                    else:
-                        self.get_logger().warning("⚠️  Keyframes is None, cannot add new keyframe")
-                        
-                # 🔄 週期性儲存：基於時間間隔，為 Unity 即時顯示準備
+                        self.get_logger().info(f"📍 New keyframe added (total: {len(self.keyframes)})")
+                
+                # Periodic saving
                 current_time = time.time()
                 if (i > 0 and self.keyframes is not None and len(self.keyframes) > 0 and 
                     current_time - self.last_save_time >= self.save_interval):
-                    self.get_logger().info(f"⏰ Time-based save triggered: {current_time - self.last_save_time:.1f}s since last save")
                     self.save_reconstruction_periodic()
                     
-                # 🔑 額外儲存：當有新 keyframe 且間隔足夠時
+                # Save on new keyframe
                 if i > 0 and self.keyframes is not None and len(self.keyframes) > 0:
                     current_kf_count = len(self.keyframes)
                     if (current_kf_count > self.last_keyframe_count and 
-                        current_time - self.last_save_time >= 2.0):  # 新 keyframe 時至少間隔 2 秒
-                        self.get_logger().info(f"🔑 Keyframe-based save triggered: {current_kf_count} keyframes")
+                        current_time - self.last_save_time >= 2.0):
                         self.save_reconstruction_periodic()
                         self.last_keyframe_count = current_kf_count
                     
-                # Log progress with stability metrics
+                # Log progress
                 if i % 30 == 0 and i > 0:
                     FPS = i / (time.time() - fps_timer)
                     kf_count = len(self.keyframes) if self.keyframes is not None else 0
-                    buffer_size = self.image_buffer.qsize()
-                    self.get_logger().info(f"📊 SLAM: {FPS:.2f} FPS, {kf_count} keyframes, Mode: {mode.name}, Buffer: {buffer_size}/10")
+                    buffer_size = len(self.image_buffer)
+                    self.get_logger().info(f"📊 SLAM: {FPS:.2f} FPS, {kf_count} keyframes, Mode: {mode.name}, Buffer: {buffer_size}/3")
                 
                 i += 1
                 self.processed_count += 1
@@ -626,8 +645,8 @@ class MASt3RSLAMVisualizationNode(Node):
             except Exception as e:
                 import traceback
                 self.get_logger().error(f"🚨 Error in SLAM processing: {str(e)}")
-                self.get_logger().error(f"🔍 Error type: {type(e).__name__}")
-                self.get_logger().error(f"📄 Traceback: {traceback.format_exc()}")
+                self.get_logger().error(f"📍 Error type: {type(e).__name__}")
+                self.get_logger().error(f"🔄 Traceback: {traceback.format_exc()}")
                 
                 # Check if critical objects are None
                 if not hasattr(self, 'keyframes') or self.keyframes is None:
@@ -642,30 +661,27 @@ class MASt3RSLAMVisualizationNode(Node):
                     self.get_logger().error("💥 Critical initialization error, stopping processing")
                     break
                 else:
-                    self.get_logger().warn("⚠️  Non-critical error, continuing processing...")
+                    self.get_logger().warn("⚠️ Non-critical error, continuing processing...")
                     time.sleep(0.1)
                     continue
         
-        # If we get here, the loop exited normally
-        self.get_logger().warn(f"🔍 Main processing loop ended normally at iteration {i}")
-
-        # Final save - but first debug why we exited
-        self.get_logger().warn(f"🔍 Processing loop exited: should_exit={should_exit}, is_processing={self.is_processing}")
-        if hasattr(self, 'states') and self.states:
-            mode = self.states.get_mode()
-            self.get_logger().warn(f"🔍 Final SLAM mode: {mode}")
-        
+        # Final save
         self.get_logger().info("💾 Saving final reconstruction...")
         self.save_reconstruction_final()
         self.cleanup_processes()
         
     def save_reconstruction_periodic(self):
-        """簡化的週期性儲存 - 直接存到 logs/ 目錄，像 main.py 一樣"""
+        """改進 3: 加鎖防止重入，使用毫秒級檔名避免撞名"""
+        # 非阻塞嘗試獲取鎖，如果已有其他儲存在進行則跳過
+        if not self.save_lock.acquire(blocking=False):
+            self.get_logger().debug("🔒 Save already in progress, skipping...")
+            return False
+            
         try:
-            # 保護存檔過程中的 keyframes 讀取
+            # 保護儲存過程中的 keyframes 讀取
             with self.keyframes_lock:
                 if self.keyframes is None:
-                    self.get_logger().warning("⚠️  Cannot save: keyframes is None")
+                    self.get_logger().warning("⚠️ Cannot save: keyframes is None")
                     return False
                     
                 num_keyframes = len(self.keyframes)
@@ -680,16 +696,16 @@ class MASt3RSLAMVisualizationNode(Node):
             import os
             os.makedirs("logs", exist_ok=True)
             
-            # 簡化的檔名生成 - 直接存到 logs/ 目錄
-            timestamp = datetime.datetime.now().strftime("%H%M%S")
-            filename = f"{self.save_as}_partial_{timestamp}.ply"
+            # 改進 3-2: 使用毫秒級時間戳避免檔名衝突
+            ts = time.time()
+            filename = f"{self.save_as}_partial_{ts:.3f}.ply"
             
             # 使用簡化的儲存函數，設定合理的置信度閾值
-            c_conf_threshold = 0.7  # 合理的置信度閾值
+            c_conf_threshold = 0.7
             
             self.get_logger().info(f"💾 Saving {num_keyframes} keyframes to logs/{filename}")
             
-            # 直接儲存到 logs/ 目錄（無需複雜的目錄結構）
+            # 直接儲存到 logs/ 目錄
             save_reconstruction("logs", filename, keyframes_snapshot, c_conf_threshold)
             
             # 更新時間戳
@@ -701,76 +717,114 @@ class MASt3RSLAMVisualizationNode(Node):
         except Exception as e:
             self.get_logger().error(f"❌ Error saving reconstruction: {str(e)}")
             import traceback
-            self.get_logger().error(f"📄 Traceback: {traceback.format_exc()}")
+            self.get_logger().error(f"🔄 Traceback: {traceback.format_exc()}")
             return False
+        finally:
+            # 確保釋放鎖
+            self.save_lock.release()
     
     def save_reconstruction_final(self):
-        """簡化的最終儲存 - 直接存到 logs/ 目錄"""
-        try:
-            if not hasattr(self, 'keyframes') or self.keyframes is None:
-                self.get_logger().info("ℹ️  No SLAM data to save (system not fully initialized)")
-                return
+        """改進 3: 最終儲存也加鎖保護"""
+        # 使用阻塞鎖確保最終儲存完成
+        with self.save_lock:
+            try:
+                if not hasattr(self, 'keyframes') or self.keyframes is None:
+                    self.get_logger().info("ℹ️ No SLAM data to save (system not fully initialized)")
+                    return
+                    
+                num_keyframes = len(self.keyframes)
+                if num_keyframes == 0:
+                    self.get_logger().info("ℹ️ No keyframes to save")
+                    return
+                    
+                # 確保 logs 目錄存在
+                import os
+                os.makedirs("logs", exist_ok=True)
                 
-            num_keyframes = len(self.keyframes)
-            if num_keyframes == 0:
-                self.get_logger().info("ℹ️  No keyframes to save")
-                return
+                # 最終檔名可選：保持 _final 或加時間戳
+                # Option 1: 固定檔名（會覆蓋）
+                filename = f"{self.save_as}_final.ply"
+                # Option 2: 加時間戳（不會覆蓋）
+                # ts = time.time()
+                # filename = f"{self.save_as}_final_{ts:.3f}.ply"
                 
-            # 確保 logs 目錄存在
-            import os
-            os.makedirs("logs", exist_ok=True)
-            
-            # 簡化的最終檔名
-            filename = f"{self.save_as}_final.ply"
-            c_conf_threshold = 0.7  # 合理的置信度閾值
-            
-            self.get_logger().info(f"📊 Saving final reconstruction: {num_keyframes} keyframes to logs/{filename}")
-            
-            # 直接儲存到 logs/ 目錄
-            save_reconstruction("logs", filename, self.keyframes, c_conf_threshold)
-            self.get_logger().info(f"✅ Final reconstruction saved: logs/{filename}")
-            
-        except Exception as e:
-            self.get_logger().error(f"❌ Error saving final reconstruction: {str(e)}")
-            import traceback
-            self.get_logger().error(f"📄 Traceback: {traceback.format_exc()}")
+                c_conf_threshold = 0.7
+                
+                self.get_logger().info(f"📊 Saving final reconstruction: {num_keyframes} keyframes to logs/{filename}")
+                
+                # 直接儲存到 logs/ 目錄
+                save_reconstruction("logs", filename, self.keyframes, c_conf_threshold)
+                self.get_logger().info(f"✅ Final reconstruction saved: logs/{filename}")
+                
+            except Exception as e:
+                self.get_logger().error(f"❌ Error saving final reconstruction: {str(e)}")
+                import traceback
+                self.get_logger().error(f"🔄 Traceback: {traceback.format_exc()}")
     
     def periodic_save_callback(self):
-        """定時器觸發的週期性儲存 - 確保 Unity 能獲得最新點雲"""
+        """改進 3: 定時器觸發的週期性儲存 - 加鎖防止重入"""
+        # 非阻塞嘗試獲取鎖，如果已有儲存在進行則跳過
+        if not hasattr(self, 'save_lock') or not self.save_lock.acquire(blocking=False):
+            # 已有儲存在進行，靜默跳過
+            return
+            
         try:
             if (hasattr(self, 'slam_initialized') and self.slam_initialized and 
                 hasattr(self, 'keyframes') and self.keyframes is not None and 
                 len(self.keyframes) > 0):
                 
-                self.get_logger().info(f"⏰ Timer-triggered save: {len(self.keyframes)} keyframes available")
-                success = self.save_reconstruction_periodic()
-                if success:
-                    self.get_logger().info("✅ Timer-based save completed for Unity streaming")
+                # 檢查距離上次儲存的時間間隔
+                time_since_last_save = time.time() - self.last_save_time
+                if time_since_last_save >= self.save_interval:
+                    self.get_logger().info(f"⏰ Timer-triggered save: {len(self.keyframes)} keyframes, {time_since_last_save:.1f}s since last save")
+                    # 注意：save_reconstruction_periodic 內部也會嘗試獲取鎖
+                    # 但因為我們已經持有鎖，所以需要先釋放
+                    self.save_lock.release()
+                    success = self.save_reconstruction_periodic()
+                    if success:
+                        self.get_logger().info("✅ Timer-based save completed for Unity streaming")
+                    else:
+                        self.get_logger().debug("⚠️ Timer-based save skipped")
+                    return  # 已經釋放鎖，直接返回
                 else:
-                    self.get_logger().info("⚠️  Timer-based save skipped (no new data)")
-            else:
-                # Silently skip if SLAM not initialized yet
-                pass
+                    self.get_logger().debug(f"⏰ Timer check: only {time_since_last_save:.1f}s since last save, skipping")
         except Exception as e:
             self.get_logger().error(f"❌ Error in periodic save callback: {str(e)}")
             import traceback
-            self.get_logger().error(f"📄 Traceback: {traceback.format_exc()}")
+            self.get_logger().error(f"🔄 Traceback: {traceback.format_exc()}")
+        finally:
+            # 確保釋放鎖（如果還持有的話）
+            try:
+                self.save_lock.release()
+            except:
+                pass  # 鎖可能已經被釋放
     
     def print_stats(self):
-        """Print processing statistics"""
+        """Print enhanced processing statistics"""
         if self.image_count > 0:
             processing_ratio = self.processed_count / self.image_count * 100
-            # Safe keyframe count - handle None case properly
+            drop_ratio = self.dropped_count / self.image_count * 100
+            
+            # Safe keyframe count
             try:
                 keyframe_count = len(self.keyframes) if (hasattr(self, 'keyframes') and self.keyframes is not None) else 0
             except (TypeError, AttributeError):
                 keyframe_count = 0
             
             time_since_last_save = time.time() - self.last_save_time if self.last_save_time > 0 else 0
-            self.get_logger().info(f"📈 Stats: {self.image_count} images received, "
-                                 f"{self.processed_count} processed ({processing_ratio:.1f}%), "
-                                 f"{keyframe_count} keyframes, "
-                                 f"last save: {time_since_last_save:.1f}s ago")
+            
+            # 計算有效 FPS（實際處理速度）
+            elapsed_time = time.time() - self.start_time
+            effective_fps = self.processed_count / elapsed_time if elapsed_time > 0 else 0
+            
+            self.get_logger().info(
+                f"📈 Stats: {self.image_count} images received, "
+                f"{self.processed_count} processed ({processing_ratio:.1f}%), "
+                f"{self.dropped_count} dropped ({drop_ratio:.1f}%), "
+                f"{keyframe_count} keyframes, "
+                f"Effective FPS: {effective_fps:.2f}, "
+                f"Last save: {time_since_last_save:.1f}s ago"
+            )
     
     def cleanup_processes(self):
         """Clean up background processes with aggressive termination"""
@@ -778,7 +832,7 @@ class MASt3RSLAMVisualizationNode(Node):
         
         # Terminate backend process
         try:
-            if hasattr(self, 'backend_process') and self.backend_process.is_alive():
+            if hasattr(self, 'backend_process') and self.backend_process and self.backend_process.is_alive():
                 print("🛑 Terminating backend process...")
                 self.backend_process.terminate()
                 self.backend_process.join(timeout=3)
@@ -791,7 +845,7 @@ class MASt3RSLAMVisualizationNode(Node):
             
         # Terminate visualization process
         try:
-            if hasattr(self, 'viz_process') and self.viz_process.is_alive():
+            if hasattr(self, 'viz_process') and self.viz_process and self.viz_process.is_alive():
                 print("🛑 Terminating visualization process...")
                 self.viz_process.terminate()
                 self.viz_process.join(timeout=3)
@@ -812,7 +866,7 @@ class MASt3RSLAMVisualizationNode(Node):
         should_exit = True
         self.is_processing = False
         
-        if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
             print("⏳ Waiting for processing thread to finish...")
             self.processing_thread.join(timeout=5)
         
@@ -840,6 +894,12 @@ def main(args=None):
         print("🚀 MASt3R-SLAM with Visualization started!")
         print("📺 Check the visualization window to monitor SLAM progress")
         print("🔴 Press Ctrl+C to stop and save reconstruction")
+        print("")
+        print("ℹ️ Performance improvements enabled:")
+        print("  • Short FIFO buffer (maxlen=3) for continuous frame processing")
+        print("  • CPU-only visualization to avoid CUDA memory issues")
+        print("  • Automatic frame dropping when processing lags")
+        print("")
         
         # Spin until shutdown
         while rclpy.ok() and not should_exit:
